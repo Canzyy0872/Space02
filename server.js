@@ -389,7 +389,7 @@ app.post("/auth/login", (req, res) => {
   }
 
   console.log(`[AUTH] Login berhasil — key=${key} slot=${slot}`);
-  res.json({ ok: true, slot, label: slots.get(slot).label || "" });
+  res.json({ ok: true, slot, key: slots.get(slot).key, label: slots.get(slot).label || "" });
 });
 
 // ─── GET / ────────────────────────────────────────────────────────────────────
