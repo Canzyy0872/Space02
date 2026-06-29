@@ -531,6 +531,13 @@ app.post("/push/:slot", requireActiveSlot, (req, res) => {
   const data = req.body;
   if (!Array.isArray(data)) return res.status(400).json({ ok: false, error: "Body must be array" });
 
+  // Validasi X-Key header — harus cocok dengan key slot
+  const xKey = (req.headers["x-key"] || "").trim();
+  const slotData = slots.get(slot);
+  if (!slotData || xKey !== slotData.key) {
+    return res.status(403).json({ ok: false, error: "Invalid key" });
+  }
+
   snapshot[slot] = data;
 
   const slotClients = getClients(slot);
