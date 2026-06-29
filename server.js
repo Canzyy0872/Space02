@@ -1,15 +1,16 @@
 /**
- * Minimap Relay Server — v2 (Slot Management Edition)
+ * Minimap Relay Server — v3 (Key Auth Edition)
  *
  * Endpoint publik:
  *   POST /push/:slot          ← C++ mod kirim data hero
  *   GET  /get/:slot           ← Android ambil snapshot awal
  *   WS   /ws/:slot            ← Android subscribe real-time
  *   GET  /status              ← health check
+ *   POST /auth/login          ← Java login pakai key → dapat slot
  *
  * Endpoint admin (Basic Auth dari ENV):
  *   GET  /admin               ← Dashboard kelola slot
- *   POST /admin/slot/add      ← Tambah / perpanjang slot
+ *   POST /admin/slot/add      ← Tambah / perpanjang slot (auto-generate key)
  *   POST /admin/slot/remove   ← Hapus slot
  *   GET  /admin/slots         ← List slot (JSON)
  *
@@ -23,6 +24,7 @@ const express  = require("express");
 const http     = require("http");
 const { WebSocketServer, OPEN } = require("ws");
 const url      = require("url");
+const crypto   = require("crypto");
 
 const app    = express();
 const server = http.createServer(app);
@@ -30,7 +32,7 @@ const wss    = new WebSocketServer({ server });
 
 // ─── Config dari Railway ENV ──────────────────────────────────────────────────
 const ADMIN_USER = process.env.ADMIN_USER || "admin";
-const ADMIN_PASS = process.env.ADMIN_PASS || "";        // WAJIB diset di Railway!
+const ADMIN_PASS = process.env.ADMIN_PASS || "";
 
 if (!ADMIN_PASS) {
   console.warn("⚠️  WARNING: ADMIN_PASS env tidak diset! Dashboard admin tidak aman.");
@@ -38,13 +40,39 @@ if (!ADMIN_PASS) {
 
 // ─── In-memory store ──────────────────────────────────────────────────────────
 /**
- * slots = Map<slotNumber, { createdAt, expiredAt, label }>
- *   expiredAt = null  → slot aktif selamanya (tidak expired)
- *   expiredAt = Date  → slot aktif sampai tanggal tersebut
+ * slots = Map<slotNumber, { createdAt, expiredAt, label, key }>
+ *   expiredAt = null  → slot aktif selamanya
+ *   key       = string 8 karakter alfanumerik random
  */
-const slots    = new Map();   // slot registry
-const snapshot = {};          // snapshot[slot] = array hero terakhir
-const clients  = {};          // clients[slot]  = Set<WebSocket>
+const slots    = new Map();
+const snapshot = {};
+const clients  = {};
+
+// ─── Key Generator ────────────────────────────────────────────────────────────
+/**
+ * Generate key random 8 karakter: huruf besar + angka
+ * Contoh: "Ahvem614", "X9Kp2Qwz"
+ */
+function generateKey() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+  let key = "";
+  const bytes = crypto.randomBytes(8);
+  for (let i = 0; i < 8; i++) {
+    key += chars[bytes[i] % chars.length];
+  }
+  return key;
+}
+
+/**
+ * Cari slot berdasarkan key
+ * Return: slotNumber atau null
+ */
+function findSlotByKey(key) {
+  for (const [num, s] of slots.entries()) {
+    if (s.key === key) return num;
+  }
+  return null;
+}
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
 function getClients(slot) {
@@ -52,15 +80,13 @@ function getClients(slot) {
   return clients[slot];
 }
 
-/** Cek apakah slot terdaftar DAN belum expired */
 function isSlotActive(slot) {
   const s = slots.get(slot);
   if (!s) return false;
-  if (s.expiredAt === null) return true;          // selamanya aktif
-  return new Date() < new Date(s.expiredAt);       // cek waktu sekarang vs expired
+  if (s.expiredAt === null) return true;
+  return new Date() < new Date(s.expiredAt);
 }
 
-/** Format tanggal ke string lokal yang mudah dibaca */
 function fmtDate(d) {
   if (!d) return "∞ Selamanya";
   const dt = new Date(d);
@@ -70,10 +96,9 @@ function fmtDate(d) {
   });
 }
 
-/** Hitung sisa waktu aktif */
 function timeLeft(expiredAt) {
   if (!expiredAt) return "Selamanya";
-  const ms   = new Date(expiredAt) - Date.now();
+  const ms = new Date(expiredAt) - Date.now();
   if (ms <= 0) return "EXPIRED";
   const d = Math.floor(ms / 86400000);
   const h = Math.floor((ms % 86400000) / 3600000);
@@ -83,7 +108,7 @@ function timeLeft(expiredAt) {
   return `${m} menit lagi`;
 }
 
-// ─── HTML halaman "slot tidak aktif" ─────────────────────────────────────────
+// ─── HTML halaman blocked ─────────────────────────────────────────────────────
 function blockedPage(slotNum) {
   return `<!DOCTYPE html>
 <html lang="id">
@@ -93,52 +118,31 @@ function blockedPage(slotNum) {
   <title>Akses Ditolak – Slot ${slotNum}</title>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-    body{
-      min-height:100vh;display:flex;align-items:center;justify-content:center;
-      background:#0a0a0f;font-family:'Segoe UI',system-ui,sans-serif;color:#e2e8f0;
-      overflow:hidden;
-    }
-    body::before{
-      content:'';position:fixed;inset:0;
+    body{min-height:100vh;display:flex;align-items:center;justify-content:center;
+         background:#0a0a0f;font-family:'Segoe UI',system-ui,sans-serif;color:#e2e8f0;overflow:hidden}
+    body::before{content:'';position:fixed;inset:0;
       background:radial-gradient(ellipse 80% 60% at 50% 0%,rgba(239,68,68,.15) 0%,transparent 70%),
                  radial-gradient(ellipse 60% 40% at 80% 100%,rgba(168,85,247,.1) 0%,transparent 70%);
-      pointer-events:none;
-    }
-    .card{
-      position:relative;text-align:center;padding:3rem 2.5rem;max-width:480px;width:90%;
-      background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);
-      border-radius:20px;backdrop-filter:blur(12px);
-      box-shadow:0 8px 40px rgba(0,0,0,.5);animation:fadeUp .6s ease both;
-    }
+      pointer-events:none}
+    .card{position:relative;text-align:center;padding:3rem 2.5rem;max-width:480px;width:90%;
+          background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);
+          border-radius:20px;backdrop-filter:blur(12px);
+          box-shadow:0 8px 40px rgba(0,0,0,.5);animation:fadeUp .6s ease both}
     @keyframes fadeUp{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}
     .icon{font-size:3rem;margin-bottom:1rem}
-    .badge{
-      display:inline-block;margin-bottom:1.2rem;padding:.3rem 1rem;
-      font-size:.7rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
-      color:#fca5a5;background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.3);
-      border-radius:999px;
-    }
+    .badge{display:inline-block;margin-bottom:1.2rem;padding:.3rem 1rem;
+           font-size:.7rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+           color:#fca5a5;background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.3);border-radius:999px}
     h1{font-size:1.6rem;font-weight:800;margin-bottom:.5rem;color:#fef2f2}
-    .slot-info{
-      font-size:1rem;color:#94a3b8;margin-bottom:.4rem;
-    }
-    .slot-num{
-      font-size:2.5rem;font-weight:900;
-      background:linear-gradient(135deg,#f87171,#fb923c);
-      -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
-    }
+    .slot-num{font-size:2.5rem;font-weight:900;
+              background:linear-gradient(135deg,#f87171,#fb923c);
+              -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
     .desc{font-size:.9rem;color:#94a3b8;margin:.8rem 0 2rem;line-height:1.7}
-    .divider{height:1px;background:rgba(255,255,255,.07);margin:1.5rem 0}
-    .contact-label{font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:#64748b;margin-bottom:.8rem}
-    .tg-btn{
-      display:inline-flex;align-items:center;gap:.55rem;
-      padding:.7rem 1.6rem;border-radius:12px;
-      background:linear-gradient(135deg,#3b82f6,#6366f1);
-      color:#fff;font-size:.9rem;font-weight:600;text-decoration:none;
-      transition:opacity .2s,transform .2s;margin-bottom:.6rem;
-    }
+    .tg-btn{display:inline-flex;align-items:center;gap:.55rem;padding:.7rem 1.6rem;border-radius:12px;
+            background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;font-size:.9rem;font-weight:600;
+            text-decoration:none;transition:opacity .2s,transform .2s}
     .tg-btn:hover{opacity:.88;transform:translateY(-2px)}
-    .tg-btn svg{width:18px;height:18px;fill:#fff;flex-shrink:0}
+    .tg-btn svg{width:18px;height:18px;fill:#fff}
     .footer{margin-top:2rem;font-size:.7rem;color:#334155}
   </style>
 </head>
@@ -147,18 +151,10 @@ function blockedPage(slotNum) {
     <div class="icon">🔒</div>
     <div class="badge">Akses Ditolak</div>
     <h1>Slot Tidak Dapat Diakses</h1>
-    <p class="slot-info">Slot</p>
     <div class="slot-num">#${slotNum}</div>
-    <p class="desc">
-      Slot ini <strong>belum terdaftar</strong> atau <strong>masa aktifnya telah habis</strong>.<br>
-      Hubungi admin untuk membuka atau memperpanjang akses slot ini.
-    </p>
-    <div class="divider"></div>
-    <p class="contact-label">Hubungi Admin</p>
+    <p class="desc">Slot ini <strong>belum terdaftar</strong> atau <strong>masa aktifnya telah habis</strong>.</p>
     <a class="tg-btn" href="https://t.me/ace_finder" target="_blank" rel="noopener">
-      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-        <path d="M9.04 15.594l-.392 5.522c.56 0 .803-.24 1.094-.528l2.625-2.507 5.44 3.966c.998.55 1.706.26 1.974-.918l3.578-16.7C23.76.99 22.89.6 21.918.998L1.116 8.874C-.275 9.424-.267 10.2.843 10.54l5.11 1.595 11.87-7.43c.56-.373 1.07-.166.65.207z"/>
-      </svg>
+      <svg viewBox="0 0 24 24"><path d="M9.04 15.594l-.392 5.522c.56 0 .803-.24 1.094-.528l2.625-2.507 5.44 3.966c.998.55 1.706.26 1.974-.918l3.578-16.7C23.76.99 22.89.6 21.918.998L1.116 8.874C-.275 9.424-.267 10.2.843 10.54l5.11 1.595 11.87-7.43c.56-.373 1.07-.166.65.207z"/></svg>
       @ace_finder
     </a>
     <div class="footer">© Space Evolution · All rights reserved</div>
@@ -169,7 +165,6 @@ function blockedPage(slotNum) {
 
 // ─── HTML Dashboard Admin ─────────────────────────────────────────────────────
 function adminDashboardHTML() {
-  const now     = Date.now();
   const allSlots = [...slots.entries()].sort((a, b) => a[0] - b[0]);
 
   const rows = allSlots.map(([num, s]) => {
@@ -186,6 +181,8 @@ function adminDashboardHTML() {
       <td>${status}</td>
       <td>${expStr}</td>
       <td class="sisa">${left}</td>
+      <td><code class="key-badge">${s.key}</code>
+          <button class="btn-copy" onclick="copyKey('${s.key}')">📋</button></td>
       <td>${conns} ws / ${heroes} hero</td>
       <td>
         <form method="POST" action="/admin/slot/remove" style="display:inline">
@@ -204,73 +201,44 @@ function adminDashboardHTML() {
   <title>Admin – Slot Manager</title>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-    body{
-      background:#0d1117;color:#c9d1d9;
-      font-family:'Segoe UI',system-ui,sans-serif;font-size:14px;
-      padding:0;margin:0;
-    }
-    header{
-      background:#161b22;border-bottom:1px solid #30363d;
-      padding:1rem 2rem;display:flex;align-items:center;gap:1rem;
-    }
+    body{background:#0d1117;color:#c9d1d9;font-family:'Segoe UI',system-ui,sans-serif;font-size:14px}
+    header{background:#161b22;border-bottom:1px solid #30363d;padding:1rem 2rem;display:flex;align-items:center;gap:1rem}
     header h1{font-size:1.1rem;font-weight:700;color:#f0f6ff}
-    header .badge{
-      padding:.2rem .7rem;border-radius:999px;font-size:.7rem;font-weight:700;
-      background:rgba(99,102,241,.2);color:#a5b4fc;border:1px solid rgba(99,102,241,.4);
-    }
-    .container{max-width:1100px;margin:0 auto;padding:2rem}
-    .section{
-      background:#161b22;border:1px solid #30363d;border-radius:12px;
-      margin-bottom:1.5rem;overflow:hidden;
-    }
-    .section-header{
-      padding:1rem 1.5rem;border-bottom:1px solid #30363d;
-      display:flex;align-items:center;gap:.5rem;
-      font-weight:600;font-size:.9rem;color:#f0f6ff;
-    }
+    header .badge{padding:.2rem .7rem;border-radius:999px;font-size:.7rem;font-weight:700;
+                  background:rgba(99,102,241,.2);color:#a5b4fc;border:1px solid rgba(99,102,241,.4)}
+    .container{max-width:1200px;margin:0 auto;padding:2rem}
+    .section{background:#161b22;border:1px solid #30363d;border-radius:12px;margin-bottom:1.5rem;overflow:hidden}
+    .section-header{padding:1rem 1.5rem;border-bottom:1px solid #30363d;display:flex;align-items:center;gap:.5rem;font-weight:600;font-size:.9rem;color:#f0f6ff}
     .section-body{padding:1.5rem}
-    /* Stats */
     .stats{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1.5rem}
-    .stat{
-      flex:1;min-width:150px;
-      background:#0d1117;border:1px solid #30363d;border-radius:10px;
-      padding:1rem 1.2rem;
-    }
+    .stat{flex:1;min-width:150px;background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:1rem 1.2rem}
     .stat-val{font-size:1.8rem;font-weight:800;color:#f0f6ff}
     .stat-lbl{font-size:.72rem;color:#6e7681;text-transform:uppercase;letter-spacing:.08em}
-    /* Form tambah */
     .form-grid{display:grid;grid-template-columns:1fr 1fr 2fr auto;gap:.8rem;align-items:end}
     label{display:block;font-size:.75rem;color:#8b949e;margin-bottom:.3rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em}
-    input,select{
-      width:100%;padding:.55rem .8rem;
-      background:#0d1117;border:1px solid #30363d;border-radius:8px;
-      color:#c9d1d9;font-size:.9rem;outline:none;
-    }
+    input,select{width:100%;padding:.55rem .8rem;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#c9d1d9;font-size:.9rem;outline:none}
     input:focus,select:focus{border-color:#6366f1}
-    .btn{
-      padding:.55rem 1.2rem;border-radius:8px;font-size:.85rem;font-weight:600;
-      border:none;cursor:pointer;transition:opacity .15s;
-    }
+    .btn{padding:.55rem 1.2rem;border-radius:8px;font-size:.85rem;font-weight:600;border:none;cursor:pointer;transition:opacity .15s}
     .btn-add{background:#6366f1;color:#fff}
     .btn-add:hover{opacity:.85}
-    .btn-del{
-      background:rgba(239,68,68,.15);color:#f87171;
-      border:1px solid rgba(239,68,68,.3);font-size:.78rem;
-      padding:.3rem .7rem;border-radius:6px;cursor:pointer;
-    }
+    .btn-del{background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3);font-size:.78rem;padding:.3rem .7rem;border-radius:6px;cursor:pointer}
     .btn-del:hover{background:rgba(239,68,68,.25)}
-    /* Table */
+    .btn-copy{background:none;border:none;cursor:pointer;font-size:.85rem;padding:.1rem .3rem;opacity:.7}
+    .btn-copy:hover{opacity:1}
     table{width:100%;border-collapse:collapse}
     th,td{padding:.7rem 1rem;text-align:left;border-bottom:1px solid #21262d;font-size:.85rem}
     th{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:#6e7681;font-weight:700}
     tr:last-child td{border-bottom:none}
     tr:hover td{background:#0d1117}
+    .key-badge{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.2rem .6rem;
+               font-family:monospace;font-size:.9rem;color:#7ee787;letter-spacing:.05em}
     .sisa{font-size:.78rem;color:#8b949e}
     .empty{text-align:center;padding:2rem;color:#6e7681}
-    @media(max-width:700px){
-      .form-grid{grid-template-columns:1fr 1fr}
-      table{font-size:.78rem}
-    }
+    .toast{position:fixed;bottom:1.5rem;right:1.5rem;background:#238636;color:#fff;
+           padding:.7rem 1.2rem;border-radius:8px;font-size:.85rem;opacity:0;
+           transition:opacity .3s;pointer-events:none;z-index:999}
+    .toast.show{opacity:1}
+    @media(max-width:700px){.form-grid{grid-template-columns:1fr 1fr}table{font-size:.78rem}}
   </style>
 </head>
 <body>
@@ -280,27 +248,13 @@ function adminDashboardHTML() {
   </header>
   <div class="container">
 
-    <!-- Stats -->
     <div class="stats">
-      <div class="stat">
-        <div class="stat-val">${slots.size}</div>
-        <div class="stat-lbl">Total Slot</div>
-      </div>
-      <div class="stat">
-        <div class="stat-val">${allSlots.filter(([n]) => isSlotActive(n)).length}</div>
-        <div class="stat-lbl">Aktif</div>
-      </div>
-      <div class="stat">
-        <div class="stat-val">${allSlots.filter(([n]) => !isSlotActive(n)).length}</div>
-        <div class="stat-lbl">Expired</div>
-      </div>
-      <div class="stat">
-        <div class="stat-val">${Object.values(clients).reduce((t, s) => t + (s?.size ?? 0), 0)}</div>
-        <div class="stat-lbl">WS Aktif</div>
-      </div>
+      <div class="stat"><div class="stat-val">${slots.size}</div><div class="stat-lbl">Total Slot</div></div>
+      <div class="stat"><div class="stat-val">${allSlots.filter(([n]) => isSlotActive(n)).length}</div><div class="stat-lbl">Aktif</div></div>
+      <div class="stat"><div class="stat-val">${allSlots.filter(([n]) => !isSlotActive(n)).length}</div><div class="stat-lbl">Expired</div></div>
+      <div class="stat"><div class="stat-val">${Object.values(clients).reduce((t, s) => t + (s?.size ?? 0), 0)}</div><div class="stat-lbl">WS Aktif</div></div>
     </div>
 
-    <!-- Tambah Slot -->
     <div class="section">
       <div class="section-header">➕ Tambah / Perpanjang Slot</div>
       <div class="section-body">
@@ -324,8 +278,7 @@ function adminDashboardHTML() {
                 <option value="forever">Selamanya</option>
                 <option value="custom">Custom Tanggal…</option>
               </select>
-              <input type="datetime-local" name="custom_date" id="custom_date"
-                     style="margin-top:.5rem;display:none"/>
+              <input type="datetime-local" name="custom_date" id="custom_date" style="margin-top:.5rem;display:none"/>
             </div>
             <div>
               <label>&nbsp;</label>
@@ -333,10 +286,12 @@ function adminDashboardHTML() {
             </div>
           </div>
         </form>
+        <p style="margin-top:.8rem;font-size:.8rem;color:#6e7681">
+          ℹ️ Key 8 karakter akan di-generate otomatis. Jika slot sudah ada, key lama akan diganti dengan yang baru.
+        </p>
       </div>
     </div>
 
-    <!-- Daftar Slot -->
     <div class="section">
       <div class="section-header">📋 Daftar Slot</div>
       ${slots.size === 0
@@ -345,7 +300,7 @@ function adminDashboardHTML() {
           <thead>
             <tr>
               <th>Slot</th><th>Label</th><th>Status</th>
-              <th>Expired At</th><th>Sisa</th><th>Koneksi</th><th>Aksi</th>
+              <th>Expired At</th><th>Sisa</th><th>Key</th><th>Koneksi</th><th>Aksi</th>
             </tr>
           </thead>
           <tbody>${rows}</tbody>
@@ -353,18 +308,27 @@ function adminDashboardHTML() {
     </div>
 
   </div>
+
+  <div class="toast" id="toast">✅ Key disalin!</div>
+
   <script>
     function toggleCustom(v){
       document.getElementById('custom_date').style.display = v==='custom' ? 'block' : 'none';
     }
-    // Auto-refresh tiap 30 detik untuk update status
+    function copyKey(key){
+      navigator.clipboard.writeText(key).then(() => {
+        const t = document.getElementById('toast');
+        t.classList.add('show');
+        setTimeout(() => t.classList.remove('show'), 2000);
+      });
+    }
     setTimeout(() => location.reload(), 30000);
   </script>
 </body>
 </html>`;
 }
 
-// ─── Middleware global ────────────────────────────────────────────────────────
+// ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
@@ -375,7 +339,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── Middleware: Basic Auth untuk /admin ──────────────────────────────────────
 function requireAdmin(req, res, next) {
   const authHeader = req.headers["authorization"] || "";
   const base64     = authHeader.replace(/^Basic\s+/, "");
@@ -384,7 +347,6 @@ function requireAdmin(req, res, next) {
     const [u, p] = Buffer.from(base64, "base64").toString().split(":");
     ok = (u === ADMIN_USER && p === ADMIN_PASS && ADMIN_PASS !== "");
   } catch (_) {}
-
   if (!ok) {
     res.setHeader("WWW-Authenticate", 'Basic realm="Slot Manager Admin"');
     return res.status(401).send("Login diperlukan.");
@@ -392,20 +354,43 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// ─── Middleware: Cek slot aktif untuk /push & /get ────────────────────────────
 function requireActiveSlot(req, res, next) {
   const slot = parseInt(req.params.slot, 10);
   if (isNaN(slot)) return res.status(400).json({ ok: false, error: "Invalid slot" });
   if (!isSlotActive(slot)) {
-    // Untuk request browser tampilkan halaman HTML, untuk API/curl JSON
     const accept = req.headers["accept"] || "";
-    if (accept.includes("text/html")) {
-      return res.status(403).send(blockedPage(slot));
-    }
+    if (accept.includes("text/html")) return res.status(403).send(blockedPage(slot));
     return res.status(403).json({ ok: false, error: `Slot #${slot} tidak aktif atau belum terdaftar.` });
   }
   next();
 }
+
+// ─── POST /auth/login ─────────────────────────────────────────────────────────
+// Java kirim key → server balas slot number
+// Body: { "key": "Ahvem614" }
+// Response: { "ok": true, "slot": 3 }  atau  { "ok": false, "error": "..." }
+app.post("/auth/login", (req, res) => {
+  const key = (req.body.key || "").trim();
+
+  if (!key || key.length !== 8) {
+    return res.status(400).json({ ok: false, error: "Key tidak valid (harus 8 karakter)" });
+  }
+
+  const slot = findSlotByKey(key);
+
+  if (slot === null) {
+    console.log(`[AUTH] Key tidak ditemukan: ${key}`);
+    return res.status(401).json({ ok: false, error: "Key tidak ditemukan" });
+  }
+
+  if (!isSlotActive(slot)) {
+    console.log(`[AUTH] Key valid tapi slot #${slot} sudah expired: ${key}`);
+    return res.status(403).json({ ok: false, error: `Slot #${slot} sudah expired. Hubungi admin.` });
+  }
+
+  console.log(`[AUTH] Login berhasil — key=${key} slot=${slot}`);
+  res.json({ ok: true, slot, label: slots.get(slot).label || "" });
+});
 
 // ─── GET / ────────────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
@@ -424,7 +409,7 @@ app.get("/", (req, res) => {
       background:radial-gradient(ellipse 80% 60% at 50% 0%,rgba(99,102,241,.18) 0%,transparent 70%),
                  radial-gradient(ellipse 60% 40% at 80% 100%,rgba(168,85,247,.12) 0%,transparent 70%);
       pointer-events:none}
-    .card{position:relative;text-align:center;padding:3rem 2.5rem;max-width:480px;width:90%;
+    .card{text-align:center;padding:3rem 2.5rem;max-width:480px;width:90%;
           background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);
           border-radius:20px;backdrop-filter:blur(12px);box-shadow:0 8px 40px rgba(0,0,0,.5);
           animation:fadeUp .6s ease both}
@@ -432,19 +417,16 @@ app.get("/", (req, res) => {
     .badge{display:inline-block;margin-bottom:1.2rem;padding:.3rem 1rem;font-size:.7rem;
            font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#a5b4fc;
            background:rgba(99,102,241,.15);border:1px solid rgba(99,102,241,.3);border-radius:999px}
-    .logo{font-size:2.2rem;font-weight:800;letter-spacing:-.02em;
+    .logo{font-size:2.2rem;font-weight:800;
           background:linear-gradient(135deg,#818cf8 0%,#c084fc 100%);
           -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:.4rem}
     .sub{font-size:.95rem;color:#94a3b8;margin-bottom:2rem;line-height:1.6}
     .divider{height:1px;background:rgba(255,255,255,.07);margin:1.5rem 0}
-    .contact-label{font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:#64748b;margin-bottom:.8rem}
     .tg-btn{display:inline-flex;align-items:center;gap:.55rem;padding:.7rem 1.6rem;border-radius:12px;
             background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;font-size:.9rem;font-weight:600;
-            text-decoration:none;transition:opacity .2s,transform .2s;margin-bottom:.6rem}
+            text-decoration:none;transition:opacity .2s,transform .2s}
     .tg-btn:hover{opacity:.88;transform:translateY(-2px)}
-    .tg-btn svg{width:18px;height:18px;fill:#fff;flex-shrink:0}
-    .channel-link{display:block;margin-top:.5rem;font-size:.8rem;color:#6366f1;text-decoration:none;transition:color .2s}
-    .channel-link:hover{color:#a5b4fc}
+    .tg-btn svg{width:18px;height:18px;fill:#fff}
     .footer{margin-top:2rem;font-size:.7rem;color:#334155}
   </style>
 </head>
@@ -454,13 +436,9 @@ app.get("/", (req, res) => {
     <div class="logo">DomainBuy</div>
     <p class="sub">Minimap Plug-In MLBB<br>by Space Evolution.</p>
     <div class="divider"></div>
-    <p class="contact-label">Hubungi Owner</p>
     <a class="tg-btn" href="https://t.me/ace_finder" target="_blank" rel="noopener">
       <svg viewBox="0 0 24 24"><path d="M9.04 15.594l-.392 5.522c.56 0 .803-.24 1.094-.528l2.625-2.507 5.44 3.966c.998.55 1.706.26 1.974-.918l3.578-16.7C23.76.99 22.89.6 21.918.998L1.116 8.874C-.275 9.424-.267 10.2.843 10.54l5.11 1.595 11.87-7.43c.56-.373 1.07-.166.65.207z"/></svg>
       @ace_finder
-    </a>
-    <a class="channel-link" href="https://t.me/SpaceOfficialNew" target="_blank" rel="noopener">
-      📢 Channel: t.me/SpaceOfficialNew
     </a>
     <div class="footer">© Space Evolution · All rights reserved</div>
   </div>
@@ -469,18 +447,16 @@ app.get("/", (req, res) => {
 });
 
 // ─── Admin routes ─────────────────────────────────────────────────────────────
-
-/** GET /admin — Dashboard HTML */
 app.get("/admin", requireAdmin, (req, res) => {
   res.setHeader("Content-Type", "text/html");
   res.send(adminDashboardHTML());
 });
 
-/** GET /admin/slots — List slot dalam JSON (untuk API/debug) */
 app.get("/admin/slots", requireAdmin, (req, res) => {
   const result = [...slots.entries()].map(([num, s]) => ({
     slot     : num,
     label    : s.label,
+    key      : s.key,
     active   : isSlotActive(num),
     createdAt: s.createdAt,
     expiredAt: s.expiredAt ?? null,
@@ -491,7 +467,6 @@ app.get("/admin/slots", requireAdmin, (req, res) => {
   res.json({ ok: true, count: result.length, slots: result });
 });
 
-/** POST /admin/slot/add — Tambah atau perbarui slot */
 app.post("/admin/slot/add", requireAdmin, (req, res) => {
   const slotNum    = parseInt(req.body.slot, 10);
   const label      = (req.body.label || "").trim();
@@ -518,19 +493,20 @@ app.post("/admin/slot/add", requireAdmin, (req, res) => {
   }
 
   const existing = slots.get(slotNum);
+  // Key selalu di-generate ulang saat slot dibuat/diperbarui
+  const newKey = generateKey();
+
   slots.set(slotNum, {
     createdAt: existing?.createdAt || new Date().toISOString(),
     expiredAt,
     label,
+    key: newKey,
   });
 
-  console.log(`[ADMIN] Slot #${slotNum} ${existing ? "diperbarui" : "ditambahkan"} — expired: ${expiredAt ?? "selamanya"}`);
-
-  // Redirect balik ke dashboard
+  console.log(`[ADMIN] Slot #${slotNum} ${existing ? "diperbarui" : "ditambahkan"} — key=${newKey} expired=${expiredAt ?? "selamanya"}`);
   res.redirect("/admin");
 });
 
-/** POST /admin/slot/remove — Hapus slot */
 app.post("/admin/slot/remove", requireAdmin, (req, res) => {
   const slotNum = parseInt(req.body.slot, 10);
   if (isNaN(slotNum)) return res.status(400).send("Slot tidak valid.");
@@ -538,12 +514,9 @@ app.post("/admin/slot/remove", requireAdmin, (req, res) => {
   slots.delete(slotNum);
   delete snapshot[slotNum];
 
-  // Tutup semua WS yang masih connect ke slot ini
   if (clients[slotNum]) {
     clients[slotNum].forEach((ws) => {
-      if (ws.readyState === OPEN) {
-        ws.close(1008, `Slot #${slotNum} dihapus oleh admin.`);
-      }
+      if (ws.readyState === OPEN) ws.close(1008, `Slot #${slotNum} dihapus oleh admin.`);
     });
     delete clients[slotNum];
   }
@@ -581,11 +554,7 @@ app.get("/status", (req, res) => {
   const info = {};
   for (const slot of Object.keys(clients)) {
     const n = parseInt(slot);
-    info[slot] = {
-      active   : isSlotActive(n),
-      connected: getClients(n).size,
-      heroes   : (snapshot[n] ?? []).length,
-    };
+    info[slot] = { active: isSlotActive(n), connected: getClients(n).size, heroes: (snapshot[n] ?? []).length };
   }
   res.json({ ok: true, totalSlots: slots.size, slots: info, uptime: Math.floor(process.uptime()) + "s" });
 });
@@ -593,23 +562,14 @@ app.get("/status", (req, res) => {
 // ─── WebSocket /ws/:slot ──────────────────────────────────────────────────────
 wss.on("connection", (ws, req) => {
   const parsed = url.parse(req.url);
-  const parts  = parsed.pathname.split("/").filter(Boolean); // ["ws", "7"]
+  const parts  = parsed.pathname.split("/").filter(Boolean);
   const slot   = parseInt(parts[1], 10);
 
-  if (isNaN(slot)) {
-    ws.close(1008, "Invalid slot");
-    return;
-  }
+  if (isNaN(slot)) { ws.close(1008, "Invalid slot"); return; }
 
-  // Cek slot aktif
   if (!isSlotActive(slot)) {
-    // Kirim pesan error sebelum tutup
     try {
-      ws.send(JSON.stringify({
-        event  : "error",
-        code   : "SLOT_INACTIVE",
-        message: `Slot #${slot} tidak aktif. Hubungi admin: @ace_finder`,
-      }));
+      ws.send(JSON.stringify({ event: "error", code: "SLOT_INACTIVE", message: `Slot #${slot} tidak aktif.` }));
     } catch (_) {}
     ws.close(1008, `Slot #${slot} tidak aktif`);
     return;
@@ -619,49 +579,24 @@ wss.on("connection", (ws, req) => {
   slotClients.add(ws);
   console.log(`[WS] Connect slot=${slot}, total=${slotClients.size}`);
 
-  // Kirim snapshot awal
   if (snapshot[slot] && snapshot[slot].length > 0) {
     ws.send(JSON.stringify({ event: "hero_update", payload: snapshot[slot] }));
   }
 
-  // Ping tiap 20 detik
-  const pingInterval = setInterval(() => {
-    if (ws.readyState === OPEN) ws.ping();
-  }, 20000);
-
-  // Cek expired tiap 60 detik
-  const expiryCheck = setInterval(() => {
+  const pingInterval = setInterval(() => { if (ws.readyState === OPEN) ws.ping(); }, 20000);
+  const expiryCheck  = setInterval(() => {
     if (!isSlotActive(slot)) {
-      try {
-        ws.send(JSON.stringify({
-          event  : "error",
-          code   : "SLOT_EXPIRED",
-          message: `Slot #${slot} telah expired. Hubungi admin: @ace_finder`,
-        }));
-      } catch (_) {}
+      try { ws.send(JSON.stringify({ event: "error", code: "SLOT_EXPIRED", message: `Slot #${slot} expired.` })); } catch (_) {}
       ws.close(1001, `Slot #${slot} expired`);
     }
   }, 60000);
 
-  ws.on("close", () => {
-    slotClients.delete(ws);
-    clearInterval(pingInterval);
-    clearInterval(expiryCheck);
-    console.log(`[WS] Disconnect slot=${slot}, remaining=${slotClients.size}`);
-  });
-
-  ws.on("error", (err) => {
-    console.error(`[WS] Error slot=${slot}:`, err.message);
-    slotClients.delete(ws);
-    clearInterval(pingInterval);
-    clearInterval(expiryCheck);
-  });
+  ws.on("close", () => { slotClients.delete(ws); clearInterval(pingInterval); clearInterval(expiryCheck); console.log(`[WS] Disconnect slot=${slot}, remaining=${slotClients.size}`); });
+  ws.on("error", (err) => { console.error(`[WS] Error slot=${slot}:`, err.message); slotClients.delete(ws); clearInterval(pingInterval); clearInterval(expiryCheck); });
 });
 
-// ─── 404 catch-all ────────────────────────────────────────────────────────────
-// Kalau path tidak dikenali, coba ekstrak slot dari URL dan tampilkan blocked page
+// ─── 404 ──────────────────────────────────────────────────────────────────────
 app.use((req, res) => {
-  // Coba ekstrak angka dari path sebagai "slot hint"
   const match = req.path.match(/(\d+)/);
   const slot  = match ? parseInt(match[1], 10) : 0;
   res.status(404).send(blockedPage(slot || "??"));
@@ -670,12 +605,13 @@ app.use((req, res) => {
 // ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`\n🚀 Minimap Relay v2 running on port ${PORT}`);
-  console.log(`   POST /push/:slot     ← C++ mod`);
-  console.log(`   GET  /get/:slot      ← Android fallback`);
-  console.log(`   WS   /ws/:slot       ← Android realtime`);
-  console.log(`   GET  /status         ← health check`);
-  console.log(`   GET  /admin          ← Dashboard admin`);
+  console.log(`\n🚀 Minimap Relay v3 (Key Auth) running on port ${PORT}`);
+  console.log(`   POST /auth/login      ← Java login pakai key`);
+  console.log(`   POST /push/:slot      ← C++ mod`);
+  console.log(`   GET  /get/:slot       ← Android fallback`);
+  console.log(`   WS   /ws/:slot        ← Android realtime`);
+  console.log(`   GET  /status          ← health check`);
+  console.log(`   GET  /admin           ← Dashboard admin`);
   console.log(`\n   Admin user : ${ADMIN_USER}`);
   console.log(`   Admin pass : ${ADMIN_PASS ? "[set dari ENV]" : "⚠️  BELUM DISET!"}\n`);
 });
